@@ -26,6 +26,12 @@ class BleManager extends Ble.BleDelegate {
     private var _statusView = null;
     private var _reporter = null;     // periodic sensor telemetry sender
 
+    // Serialized write queue: one outstanding write at a time. The next frame is
+    // sent from onCharacteristicWrite, so the BLE stack never holds several writes.
+    private const MAX_TX_QUEUE = 24;  // beyond this, drop oldest to favor fresh data
+    private var _txQueue = [];
+    private var _txBusy = false;
+
     public var connState = "idle";
     public var rssi = null;
 
@@ -42,6 +48,7 @@ class BleManager extends Ble.BleDelegate {
     function shutdown() {
         stopScan();
         stopReporting();
+        resetTx();
         if (_device != null) {
             Ble.unpairDevice(_device);
             _device = null;
@@ -191,6 +198,7 @@ class BleManager extends Ble.BleDelegate {
             startReporting();
         } else {
             stopReporting();
+            resetTx();
             _device = null;
             setState("disconnected");
         }
@@ -210,19 +218,42 @@ class BleManager extends Ble.BleDelegate {
         }
     }
 
-    // Write a byte array to the ESP32's data characteristic.
+    // Queue a byte array for serialized writing to the ESP32's data characteristic.
     function sendData(bytes) {
+        if (!isConnected()) {
+            return false;
+        }
+        if (_txQueue.size() >= MAX_TX_QUEUE) {
+            _txQueue = _txQueue.slice(1, null);   // drop oldest (stale) frame
+        }
+        _txQueue.add(bytes);
+        pumpTx();
+        return true;
+    }
+
+    // Send the head of the queue if no write is in flight.
+    private function pumpTx() {
+        if (_txBusy || _txQueue.size() == 0) {
+            return;
+        }
         var ch = getDataChar();
         if (ch == null) {
-            return false;
+            _txQueue = [];
+            return;
         }
+        _txBusy = true;
         try {
-            ch.requestWrite(bytes, { :writeType => Ble.WRITE_TYPE_WITH_RESPONSE });
-            return true;
+            ch.requestWrite(_txQueue[0], { :writeType => Ble.WRITE_TYPE_WITH_RESPONSE });
         } catch (ex) {
             System.println("write failed: " + ex.getErrorMessage());
-            return false;
+            _txBusy = false;
+            _txQueue = _txQueue.slice(1, null);
         }
+    }
+
+    private function resetTx() {
+        _txQueue = [];
+        _txBusy = false;
     }
 
     function isConnected() {
@@ -230,6 +261,11 @@ class BleManager extends Ble.BleDelegate {
     }
 
     function onCharacteristicWrite(characteristic, status) {
+        if (_txQueue.size() > 0) {
+            _txQueue = _txQueue.slice(1, null);
+        }
+        _txBusy = false;
+        pumpTx();
     }
 
     function onCharacteristicChanged(characteristic, value) {

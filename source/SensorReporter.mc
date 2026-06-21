@@ -1,87 +1,108 @@
 using Toybox.Sensor;
-using Toybox.Timer;
 using Toybox.System;
 using Toybox.Lang;
 
 //
-// SensorReporter - periodically pushes heart rate + accelerometer to the ESP32.
+// SensorReporter - streams heart rate + high-rate accelerometer to the ESP32.
 //
-// Runs only while the BLE link is up (started/stopped from BleManager). Every
-// PERIOD_MS it reads the latest sensor sample and writes a fixed 7-byte frame
-// to the ESP32's data characteristic via gBle.sendData().
+// Uses Sensor.registerSensorDataListener so the OS batches accelerometer samples
+// (SAMPLE_RATE Hz) and delivers them once per :period second. That is far cheaper
+// than waking a Timer and polling Sensor.getInfo(), and gives real motion data.
 //
-// Payload (big-endian):
-//   byte 0    : heart rate, bpm           (0..255, 0 = no reading)
-//   bytes 1-2 : accel X, milli-g          (int16, signed)
-//   bytes 3-4 : accel Y, milli-g          (int16, signed)
-//   bytes 5-6 : accel Z, milli-g          (int16, signed)
+// Each callback's samples are chunked into BLE frames and queued for serialized
+// writing (BleManager drains the queue one write at a time, so nothing is lost).
 //
-// Note: the current ESP32 firmware reads byte 0 as brightness, so as-is the
-// light will track heart rate. Reorder the frame if that's not desired.
+// Wire frame (big-endian), variable length:
+//   byte 0      : heart rate, bpm                 (0..255, 0 = no reading)
+//   byte 1      : N = accel sample count in frame (1..SAMPLES_PER_FRAME)
+//   then N times: accel X,Y,Z as int16 (milli-g)  (6 bytes each)
+//
+// SAMPLES_PER_FRAME is sized so one frame fits a conservative 20-byte BLE write
+// (2 + 3*6 = 20). Orientation (pitch/roll) is computed on the ESP32.
 //
 class SensorReporter {
 
-    private const PERIOD_MS = 2000;     // send every 2 seconds
+    private const SAMPLE_RATE       = 25;   // accel samples per second
+    private const SAMPLES_PER_FRAME = 3;    // keeps each frame within 20 bytes
 
-    private var _timer = null;
+    private var _listening = false;
 
-    // Begin sampling sensors and start the periodic send timer.
-    function start() {
-        if (_timer != null) {
-            return;                     // already running
+    // Begin batched sensor sampling.
+    function start() as Void {
+        if (_listening) {
+            return;
         }
-        Sensor.setEnabledSensors([Sensor.SENSOR_HEARTRATE]);
-        Sensor.enableSensorEvents(method(:onSensor));
-
-        _timer = new Timer.Timer();
-        _timer.start(method(:onTick), PERIOD_MS, true);   // repeating
+        var options = {
+            :period => 1,                       // one callback per second
+            :accelerometer => {
+                :enabled    => true,
+                :sampleRate => SAMPLE_RATE
+            },
+            :heartRate => {
+                :enabled => true
+            }
+        };
+        Sensor.registerSensorDataListener(method(:onData), options);
+        _listening = true;
     }
 
-    // Stop the timer and release the sensors.
-    function stop() {
-        if (_timer != null) {
-            _timer.stop();
-            _timer = null;
+    // Stop the listener and release the sensors.
+    function stop() as Void {
+        if (!_listening) {
+            return;
         }
-        Sensor.enableSensorEvents(null);
+        Sensor.unregisterSensorDataListener();
+        _listening = false;
     }
 
-    // Sensor.Info arrives here; we just read fresh data in onTick() instead.
-    function onSensor(info as Sensor.Info) as Void {
-    }
-
-    // Build the telemetry frame and send it if still connected.
-    function onTick() as Void {
+    // A batch of samples for the elapsed period arrives here.
+    function onData(data as Sensor.SensorData) as Void {
         if (gBle == null || !gBle.isConnected()) {
             return;
         }
 
-        var info = Sensor.getInfo();
-        var hr = 0;
-        var ax = 0;
-        var ay = 0;
-        var az = 0;
+        var hr = latestHeartRate();
 
-        if (info != null) {
-            if (info.heartRate != null) {
-                hr = info.heartRate;
-            }
-            if (info.accel != null) {
-                ax = info.accel[0];
-                ay = info.accel[1];
-                az = info.accel[2];
-            }
+        var accel = data.accelerometerData;
+        if (accel == null) {
+            return;
+        }
+        var xs = accel.x;
+        var ys = accel.y;
+        var zs = accel.z;
+        if (xs == null || ys == null || zs == null) {
+            return;
         }
 
-        var frame = []b;
-        frame.add(clampByte(hr));
-        appendI16(frame, ax);
-        appendI16(frame, ay);
-        appendI16(frame, az);
+        var n = xs.size();
+        var i = 0;
+        while (i < n) {
+            var count = n - i;
+            if (count > SAMPLES_PER_FRAME) {
+                count = SAMPLES_PER_FRAME;
+            }
 
-        var ok = gBle.sendData(frame);
-        System.println("telemetry -> hr=" + hr +
-                       " accel=[" + ax + "," + ay + "," + az + "] sent=" + ok);
+            var frame = []b;
+            frame.add(clampByte(hr));
+            frame.add(count);
+            for (var j = 0; j < count; j++) {
+                appendI16(frame, xs[i + j]);
+                appendI16(frame, ys[i + j]);
+                appendI16(frame, zs[i + j]);
+            }
+            gBle.sendData(frame);
+            i += count;
+        }
+    }
+
+    // Current heart rate in bpm (cached, ~1 Hz), or 0 if none. The data listener
+    // only reports beat-to-beat intervals, so we read bpm from getInfo() instead.
+    private function latestHeartRate() {
+        var info = Sensor.getInfo();
+        if (info != null && info.heartRate != null) {
+            return info.heartRate;
+        }
+        return 0;
     }
 
     private function clampByte(v) {
