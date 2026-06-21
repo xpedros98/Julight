@@ -1,0 +1,3 @@
+# Default build configuration.
+# Source (./source) and resources (./resources) are discovered automatically.
+project.manifest = manifest.xml

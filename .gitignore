@@ -1,0 +1,10 @@
+# Build output
+/bin/
+
+# Developer signing key must never be committed
+*.der
+*.pem
+
+# Editor / OS
+.DS_Store
+*.swp

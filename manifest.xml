@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<iq:manifest xmlns:iq="http://www.garmin.com/xml/connectiq" version="3">
+    <!--
+        Julight - BLE sensor link for Garmin (fenix 7X Solar)
+        App id was generated with `openssl rand -hex 16`.
+    -->
+    <iq:application entry="JulightApp"
+                    id="5a4aed4fb5ab35beb0f8b890a8f45521"
+                    launcherIcon="@Drawables.LauncherIcon"
+                    name="@Strings.AppName"
+                    type="watch-app"
+                    minApiLevel="3.2.0">
+        <iq:products>
+            <iq:product id="fenix7x"/>
+        </iq:products>
+        <iq:permissions>
+            <!-- BLE central: scan / connect / read RSSI / GATT read-write -->
+            <iq:uses-permission id="BluetoothLowEnergy"/>
+            <!-- Accelerometer + heart rate -->
+            <iq:uses-permission id="Sensor"/>
+        </iq:permissions>
+        <iq:languages>
+            <iq:language>eng</iq:language>
+        </iq:languages>
+    </iq:application>
+</iq:manifest>
