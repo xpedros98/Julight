@@ -33,7 +33,6 @@ class BleManager extends Ble.BleDelegate {
     private var _txBusy = false;
 
     public var connState = "idle";
-    public var rssi = null;
     public var txCount = 0;           // confirmed writes, for on-screen feedback
 
     function initialize() {
@@ -186,7 +185,6 @@ class BleManager extends Ble.BleDelegate {
 
     function connectTo(scanResult as Ble.ScanResult) {
         stopScan();
-        rssi = scanResult.getRssi();
         _device = Ble.pairDevice(scanResult);
         setState("connecting");
     }
@@ -275,18 +273,6 @@ class BleManager extends Ble.BleDelegate {
     }
 
     function onCharacteristicChanged(characteristic, value) {
-        // Notify payload from the ESP32: 1 signed byte = live link RSSI (dBm).
-        if (value != null && value.size() >= 1) {
-            var r = value[0];
-            if (r > 127) {
-                r -= 256;               // interpret as int8
-            }
-            rssi = r;
-            if (_statusView != null) {
-                _statusView.updateState(connState, rssi);
-            }
-            WatchUi.requestUpdate();
-        }
     }
 
     function onDescriptorWrite(descriptor, status) {
@@ -330,7 +316,7 @@ class BleManager extends Ble.BleDelegate {
     private function setState(s) {
         connState = s;
         if (_statusView != null) {
-            _statusView.updateState(connState, rssi);
+            _statusView.updateState(connState);
         }
         WatchUi.requestUpdate();
     }
