@@ -1,19 +1,20 @@
 // Julight - ESP32 light controller with BLE.
 //
-// Keeps the original physical selector (pins 4/5) + smooth PWM light on GPIO 27,
-// drives a constant-speed motor (L9110S), counts revolutions from a microswitch
-// encoder, and exposes a BLE peripheral for a Garmin watch.
+// Pulses a light (IRLZ44N on GPIO 27) with a sinusoidal "breathing" brightness
+// whose frequency is the heart rate: a calm DEFAULT_HR (75 bpm) with no watch
+// connected, the watch's live (higher) HR while connected, back to default on
+// disconnect. Also drives a constant-speed motor (L9110S) and counts revolutions
+// from a microswitch encoder. Exposes a BLE peripheral for a Garmin watch.
 //
 // BLE contract (must match the Connect IQ app):
 //   Service : c3a1f200-9b0e-4f1a-8a01-0e1d2c3b4a59  (advertised)
 //   Data    : c3a1f201-...  watch -> ESP32, WRITE   (telemetry frame, see below)
-//   Notify  : c3a1f202-...  ESP32 -> watch, NOTIFY  (1 byte = current brightness)
+//   Notify  : c3a1f202-...  ESP32 -> watch, NOTIFY  (unused for now)
 //
 //   Data frame: [HR][N][ N x (accelX,Y,Z int16 big-endian, milli-g) ].
-//   Byte 0 (HR) currently drives brightness.
+//   Byte 0 (HR) sets the pulse frequency.
 //
-// Control model: "last input wins". The physical selector overrides only when it
-// changes position; a BLE write overrides until the selector is moved.
+// The toggle switch (pins 4/5) scales overall brightness: OFF / MED / FULL.
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -43,16 +44,17 @@ const int MOTOR_SPEED = 200;    // constant drive PWM, 0..255 (one direction)
 // (3 ms -> up to ~20000 rpm, far beyond a mechanical microswitch).
 const uint32_t REV_DEBOUNCE_US = 3000;
 
-volatile int currentBrightness = 0;
-volatile int targetBrightness  = 0;
+const int DEFAULT_HR = 75;             // pulse rate (bpm) with no watch connected
+volatile int activeHrBpm = DEFAULT_HR; // current HR driving the light pulse
+int   currentBrightness  = 0;          // last value written to the light
+float pulsePhase         = 0.0f;       // sinusoid phase, radians
 
 // Encoder state, updated from the microswitch interrupt.
 volatile uint32_t revCount    = 0;   // total revolutions counted
 volatile uint32_t revPeriodUs = 0;   // micros between the last two revolutions
 volatile uint32_t lastEdgeUs  = 0;   // timestamp of the last accepted edge
 
-int  lastSwitchTarget = -1;     // edge detection for the physical selector
-bool deviceConnected  = false;
+bool deviceConnected = false;
 
 BLECharacteristic* notifyChar = nullptr;
 
@@ -89,12 +91,6 @@ static int16_t readI16BE(const uint8_t* p) {
   return (int16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
-static int clampByte(int v) {
-  if (v < 0)   { return 0; }
-  if (v > 255) { return 255; }
-  return v;
-}
-
 // OFF / MEDIUM / FULL from the physical selector (unchanged logic).
 int readSwitchTarget() {
   bool lowState  = digitalRead(pinLow);
@@ -111,6 +107,7 @@ class ServerCallbacks : public BLEServerCallbacks {
   }
   void onDisconnect(BLEServer* s) override {
     deviceConnected = false;
+    activeHrBpm = DEFAULT_HR;             // fall back to the default pulse rate
     Serial.println("master disconnected");
     BLEDevice::startAdvertising();        // allow the watch to reconnect
   }
@@ -132,7 +129,7 @@ class DataCallbacks : public BLECharacteristicCallbacks {
     }
 
     lastHr = hr;
-    targetBrightness = clampByte(hr);          // brightness tracks heart rate
+    activeHrBpm = (hr > 0) ? hr : DEFAULT_HR;   // HR sets the pulse frequency
 
     // Process every accelerometer sample; keep the most recent as "last".
     for (uint8_t i = 0; i < n; i++) {
@@ -173,9 +170,6 @@ void setup() {
   pinMode(pinEncoder, INPUT_PULLUP);     // closes to GND -> falling edge per rev
   attachInterrupt(digitalPinToInterrupt(pinEncoder), onRevolution, FALLING);
 
-  targetBrightness = readSwitchTarget();
-  lastSwitchTarget = targetBrightness;
-
   motorRun();                            // spin at constant speed
 
   BLEDevice::init(DEVICE_NAME);
@@ -209,30 +203,25 @@ void setup() {
 }
 
 void loop() {
-  // Physical selector overrides only when it actually changes (last input wins).
-  int sw = readSwitchTarget();
-  if (sw != lastSwitchTarget) {
-    targetBrightness = sw;
-    lastSwitchTarget = sw;
+  // Sinusoidal "breathing" pulse at the active heart rate. Advance the phase by
+  // the elapsed time so changing HR shifts frequency without any discontinuity.
+  // The toggle switch scales overall brightness (OFF=0, MED~half, FULL=full).
+  float scale = readSwitchTarget() / 255.0f;
+
+  static uint32_t lastUs = micros();
+  uint32_t nowUs = micros();
+  float dt = (nowUs - lastUs) / 1000000.0f;     // seconds since last loop
+  lastUs = nowUs;
+
+  float freq = activeHrBpm / 60.0f;             // beats per second
+  pulsePhase += 2.0f * PI * freq * dt;
+  if (pulsePhase >= 2.0f * PI) {
+    pulsePhase -= 2.0f * PI;
   }
 
-  // Smooth transition.
-  if (currentBrightness < targetBrightness) {
-    currentBrightness++;
-  } else if (currentBrightness > targetBrightness) {
-    currentBrightness--;
-  }
+  float s = (sinf(pulsePhase) + 1.0f) * 0.5f;   // 0..1
+  currentBrightness = (int)(s * 255.0f * scale + 0.5f);
   analogWrite(ledPin, currentBrightness);
-
-  // Tell the watch the new level once a transition settles.
-  static int lastNotified = -1;
-  if (deviceConnected && notifyChar != nullptr &&
-      currentBrightness == targetBrightness && targetBrightness != lastNotified) {
-    uint8_t b = (uint8_t) currentBrightness;
-    notifyChar->setValue(&b, 1);
-    notifyChar->notify();
-    lastNotified = targetBrightness;
-  }
 
   // Report once per completed revolution, so every period is captured. The motor
   // takes seconds per turn, so a fixed-interval print would miss or duplicate

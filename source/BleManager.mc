@@ -34,6 +34,7 @@ class BleManager extends Ble.BleDelegate {
 
     public var connState = "idle";
     public var rssi = null;
+    public var txCount = 0;           // confirmed writes, for on-screen feedback
 
     function initialize() {
         BleDelegate.initialize();
@@ -265,6 +266,11 @@ class BleManager extends Ble.BleDelegate {
             _txQueue = _txQueue.slice(1, null);
         }
         _txBusy = false;
+        txCount++;
+        if (_statusView != null) {
+            _statusView.onSent(txCount);
+        }
+        WatchUi.requestUpdate();
         pumpTx();
     }
 

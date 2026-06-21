@@ -9,8 +9,8 @@ using Toybox.Lang;
 // (SAMPLE_RATE Hz) and delivers them once per :period second. That is far cheaper
 // than waking a Timer and polling Sensor.getInfo(), and gives real motion data.
 //
-// Each callback's samples are chunked into BLE frames and queued for serialized
-// writing (BleManager drains the queue one write at a time, so nothing is lost).
+// Each callback sends ONE compact frame (a few accel samples + HR) so the BLE
+// link is never flooded; BleManager serializes writes and counts each one.
 //
 // Wire frame (big-endian), variable length:
 //   byte 0      : heart rate, bpm                 (0..255, 0 = no reading)
@@ -32,18 +32,22 @@ class SensorReporter {
         if (_listening) {
             return;
         }
+        // NOTE: valid option keys are :accelerometer / :gyroscope / :magnetometer
+        // / :heartBeatIntervals. There is no :heartRate key (an invalid key makes
+        // the accelerometer config fail and return zeros). HR comes from getInfo().
         var options = {
             :period => 1,                       // one callback per second
             :accelerometer => {
                 :enabled    => true,
                 :sampleRate => SAMPLE_RATE
-            },
-            :heartRate => {
-                :enabled => true
             }
         };
-        Sensor.registerSensorDataListener(method(:onData), options);
-        _listening = true;
+        try {
+            Sensor.registerSensorDataListener(method(:onData), options);
+            _listening = true;
+        } catch (ex) {
+            System.println("registerSensorDataListener failed: " + ex.getErrorMessage());
+        }
     }
 
     // Stop the listener and release the sensors.
@@ -75,24 +79,25 @@ class SensorReporter {
         }
 
         var n = xs.size();
-        var i = 0;
-        while (i < n) {
-            var count = n - i;
-            if (count > SAMPLES_PER_FRAME) {
-                count = SAMPLES_PER_FRAME;
-            }
-
-            var frame = []b;
-            frame.add(clampByte(hr));
-            frame.add(count);
-            for (var j = 0; j < count; j++) {
-                appendI16(frame, xs[i + j]);
-                appendI16(frame, ys[i + j]);
-                appendI16(frame, zs[i + j]);
-            }
-            gBle.sendData(frame);
-            i += count;
+        if (n == 0) {
+            return;
         }
+
+        // Send exactly ONE frame per callback (~1/s): up to SAMPLES_PER_FRAME
+        // accel samples spread across the batch. Sending every 25 Hz sample
+        // floods the BLE link (writes can't drain that fast) and builds a
+        // backlog; one small frame keeps latency low and feedback meaningful.
+        var count = (n < SAMPLES_PER_FRAME) ? n : SAMPLES_PER_FRAME;
+        var frame = []b;
+        frame.add(clampByte(hr));
+        frame.add(count);
+        for (var k = 0; k < count; k++) {
+            var idx = (count == 1) ? (n - 1) : (k * (n - 1) / (count - 1));
+            appendI16(frame, xs[idx]);
+            appendI16(frame, ys[idx]);
+            appendI16(frame, zs[idx]);
+        }
+        gBle.sendData(frame);
     }
 
     // Current heart rate in bpm (cached, ~1 Hz), or 0 if none. The data listener

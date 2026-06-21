@@ -8,6 +8,7 @@ class StatusView extends WatchUi.View {
 
     private var _state = "connecting";
     private var _rssi = null;
+    private var _sent = 0;
 
     function initialize() {
         View.initialize();
@@ -18,6 +19,7 @@ class StatusView extends WatchUi.View {
             gBle.setStatusView(self);
             _state = gBle.connState;
             _rssi = gBle.rssi;
+            _sent = gBle.txCount;
         }
     }
 
@@ -31,6 +33,11 @@ class StatusView extends WatchUi.View {
     function updateState(state, rssi) {
         _state = state;
         _rssi = rssi;
+    }
+
+    // Called by BleManager on each confirmed write (telemetry feedback).
+    function onSent(count) {
+        _sent = count;
     }
 
     function onUpdate(dc) {
@@ -54,6 +61,9 @@ class StatusView extends WatchUi.View {
                 "~ " + estimateDistance(_rssi) + " m",
                 Graphics.TEXT_JUSTIFY_CENTER);
         }
+
+        dc.drawText(cx, cy + 60, Graphics.FONT_SMALL, "sent: " + _sent,
+            Graphics.TEXT_JUSTIFY_CENTER);
 
         dc.drawText(cx, dc.getHeight() - 26, Graphics.FONT_XTINY,
             "START: send", Graphics.TEXT_JUSTIFY_CENTER);
