@@ -3,8 +3,8 @@
 // Pulses a light (IRLZ44N on GPIO 27) with a sinusoidal "breathing" brightness
 // whose frequency is the heart rate: a calm DEFAULT_HR (75 bpm) with no watch
 // connected, the watch's live (higher) HR while connected, back to default on
-// disconnect. Also drives a constant-speed motor (L9110S) and counts revolutions
-// from a microswitch encoder. Exposes a BLE peripheral for a Garmin watch.
+// disconnect. Also positions a motor (L9110S) using a microswitch encoder as the
+// 0-degree reference. Exposes a BLE peripheral for a Garmin watch.
 //
 // BLE contract (must match the Connect IQ app):
 //   Service : c3a1f200-9b0e-4f1a-8a01-0e1d2c3b4a59  (advertised)
@@ -44,7 +44,14 @@ const int pinMotorA  = 25;      // L9110S input A
 const int pinMotorB  = 26;      // L9110S input B
 const int pinEncoder = 33;      // microswitch, normally open to GND
 
-const int MOTOR_SPEED = 200;    // constant drive PWM, 0..255 (one direction)
+// Drive PWM (0..255) used for BOTH calibration and positioning. They must match:
+// the move time is derived from the calibrated revolution time, so positioning is
+// only accurate if the motor runs at the same speed it was calibrated at.
+const int MOTOR_SPEED = 200;
+
+// Motor coast after motorStop(): the move time is shortened by this to land on
+// target instead of overshooting. Tune to 0 first, then raise if it overshoots.
+const uint32_t STOP_LAG_US = 0;
 
 // Encoder contact must be stable (settled) this long before a make/break is
 // accepted. Filters bounce/chatter; keep it shorter than the switch's closed
@@ -67,15 +74,18 @@ const float PULSE_HR_MAX  = 180.0f;    // HR mapped to AMP_MAX
 // Encoder state (polled with debounce; no interrupt).
 uint32_t revCount    = 0;            // total revolutions counted
 uint32_t revPeriodUs = 0;            // micros between the last two revolutions
-uint32_t lastRevUs   = 0;            // timestamp of the last counted closure
+uint32_t lastRevUs   = 0;            // edge time of the last counted closure
 int      swStable    = HIGH;         // debounced contact state (HIGH = open)
 int      swLastRaw   = HIGH;         // last raw reading, for settle timing
 uint32_t swChangeMs  = 0;            // when the raw reading last changed
+uint32_t candidateEdgeUs = 0;        // time of the pending HIGH->LOW edge
 
 // --- Motion controller -----------------------------------------------------
-// Open-loop: the motor runs at constant speed and the encoder pulse marks 0 deg.
-// Calibration learns the time for one revolution; to reach an angle we wait for
-// a 0-pulse then run (angle/360) of that time and stop.
+// Open-loop: the motor only runs (at MOTOR_SPEED) to calibrate or to move, then
+// stops and holds. The encoder pulse marks 0 deg. Calibration learns the time
+// for one revolution; to reach an angle we wait for a 0-pulse then run
+// (angle/360) of that time and stop. Accuracy relies on the move speed matching
+// the calibration speed, so both use MOTOR_SPEED.
 const uint32_t CALIB_REVS    = 4;       // revolutions sampled during calibration
 const uint32_t CALIB_ANIM_MS = 1500;    // "calibration done" light animation
 
@@ -109,6 +119,9 @@ void pollEncoder() {
   if (raw != swLastRaw) {            // raw moved: restart the settle timer
     swLastRaw  = raw;
     swChangeMs = nowMs;
+    if (raw == LOW) {                // remember the actual contact instant...
+      candidateEdgeUs = micros();    // ...so timing isn't delayed by debounce
+    }
     return;
   }
   if (nowMs - swChangeMs < SW_DEBOUNCE_MS) {
@@ -120,9 +133,8 @@ void pollEncoder() {
 
   swStable = raw;                    // accept the debounced transition
   if (swStable == LOW) {             // confirmed closure = one revolution
-    uint32_t nowUs = micros();
-    revPeriodUs = nowUs - lastRevUs;
-    lastRevUs   = nowUs;
+    revPeriodUs = candidateEdgeUs - lastRevUs;
+    lastRevUs   = candidateEdgeUs;   // use the true edge time, not settle time
     revCount++;
   }
 }
@@ -146,7 +158,9 @@ void startCalibration() {
   Serial.println("calibrating: measuring revolution time...");
 }
 
-// Begin moving to targetDeg by timing forward from the next 0-pulse.
+// Begin moving to targetDeg by timing forward from a 0-pulse. We skip one full
+// revolution first so the motor is at steady (calibration) speed before we start
+// timing -- otherwise spin-up from a stop would corrupt the move time.
 void startPositioning() {
   if (revolutionPeriodUs == 0) {
     Serial.println("not calibrated yet - send R first");
@@ -154,7 +168,7 @@ void startPositioning() {
   }
   mode = POSITIONING;
   posSynced = false;
-  posRefRev = revCount + 1;            // reference on the next 0-pulse
+  posRefRev = revCount + 2;            // skip ~1 rev of spin-up, then reference
   motorRun();
   Serial.printf("positioning to %d deg...\n", (int) targetDeg);
 }
@@ -185,6 +199,7 @@ void updatePositioning() {
     if (revCount >= posRefRev) {        // reference 0-pulse reached
       posSynced = true;
       uint32_t runUs = (uint32_t)((targetDeg / 360.0f) * (float) revolutionPeriodUs);
+      runUs = (runUs > STOP_LAG_US) ? (runUs - STOP_LAG_US) : 0;   // coast comp.
       posStopUs = lastRevUs + runUs;
     }
     return;
