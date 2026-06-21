@@ -234,24 +234,25 @@ void loop() {
     lastNotified = targetBrightness;
   }
 
-  // Report encoder: total revolutions + RPM from the latest period (~2/sec).
-  static uint32_t lastEncPrint = 0;
-  uint32_t nowMs = millis();
-  if (nowMs - lastEncPrint >= 500) {
-    lastEncPrint = nowMs;
+  // Report once per completed revolution, so every period is captured. The motor
+  // takes seconds per turn, so a fixed-interval print would miss or duplicate
+  // readings (and any "stopped" timeout shorter than a period reads as 0 rpm).
+  static uint32_t lastReportedCount = 0;
+  noInterrupts();
+  uint32_t count  = revCount;
+  uint32_t period = revPeriodUs;
+  interrupts();
 
-    noInterrupts();
-    uint32_t period   = revPeriodUs;
-    uint32_t count    = revCount;
-    uint32_t lastEdge = lastEdgeUs;
-    interrupts();
-
-    // Treat the motor as stopped if no pulse for >2 s.
-    float rpm = 0.0f;
-    if (period > 0 && (micros() - lastEdge) < 2000000UL) {
-      rpm = 60000000.0f / (float) period;
+  if (count != lastReportedCount) {
+    lastReportedCount = count;
+    if (count >= 2) {                        // first pulse has no prior edge to time from
+      float rpm = 60000000.0f / (float) period;
+      Serial.printf("rev #%lu  period=%lu ms  rpm=%.2f\n",
+                    (unsigned long) count, (unsigned long)(period / 1000), rpm);
+    } else {
+      Serial.printf("rev #%lu  (timing starts next revolution)\n",
+                    (unsigned long) count);
     }
-    Serial.printf("encoder: revs=%lu  rpm=%.1f\n", (unsigned long) count, rpm);
   }
 
   delay(5);
