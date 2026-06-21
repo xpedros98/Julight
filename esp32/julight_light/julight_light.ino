@@ -15,6 +15,12 @@
 //   Byte 0 (HR) sets the pulse frequency.
 //
 // The toggle switch (pins 4/5) scales overall brightness: OFF / MED / FULL.
+//
+// Motor motion (open-loop, constant speed; encoder pulse = 0 degrees):
+//   On boot it spins CALIB_REVS revolutions to learn the time per revolution,
+//   plays a light animation, then positions at 180 deg. Serial commands:
+//     D<0-360>  move to that absolute position (e.g. "D65")
+//     R         recalibrate
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -66,6 +72,28 @@ int      swStable    = HIGH;         // debounced contact state (HIGH = open)
 int      swLastRaw   = HIGH;         // last raw reading, for settle timing
 uint32_t swChangeMs  = 0;            // when the raw reading last changed
 
+// --- Motion controller -----------------------------------------------------
+// Open-loop: the motor runs at constant speed and the encoder pulse marks 0 deg.
+// Calibration learns the time for one revolution; to reach an angle we wait for
+// a 0-pulse then run (angle/360) of that time and stop.
+const uint32_t CALIB_REVS    = 4;       // revolutions sampled during calibration
+const uint32_t CALIB_ANIM_MS = 1500;    // "calibration done" light animation
+
+enum Mode { CALIBRATING, CALIB_ANIM, POSITIONING, HOLDING };
+Mode mode = CALIBRATING;
+
+uint32_t revolutionPeriodUs = 0;        // learned during calibration (0 = not yet)
+float    targetDeg          = 180.0f;   // position to seek after calibration
+
+bool     calibArmed     = false;        // first 0-pulse seen, clock started
+uint32_t calibStartUs   = 0;
+uint32_t calibStartRev  = 0;
+uint32_t calibAnimStart = 0;
+
+bool     posSynced = false;             // reference 0-pulse seen for this move
+uint32_t posRefRev = 0;                 // revCount value of that reference pulse
+uint32_t posStopUs = 0;                 // when to stop the motor
+
 bool deviceConnected = false;
 
 BLECharacteristic* notifyChar = nullptr;
@@ -108,6 +136,64 @@ void motorRun() {
 void motorStop() {
   digitalWrite(pinMotorA, LOW);
   digitalWrite(pinMotorB, LOW);
+}
+
+// Start (or restart) calibration: spin and learn the revolution time.
+void startCalibration() {
+  mode = CALIBRATING;
+  calibArmed = false;
+  motorRun();
+  Serial.println("calibrating: measuring revolution time...");
+}
+
+// Begin moving to targetDeg by timing forward from the next 0-pulse.
+void startPositioning() {
+  if (revolutionPeriodUs == 0) {
+    Serial.println("not calibrated yet - send R first");
+    return;
+  }
+  mode = POSITIONING;
+  posSynced = false;
+  posRefRev = revCount + 1;            // reference on the next 0-pulse
+  motorRun();
+  Serial.printf("positioning to %d deg...\n", (int) targetDeg);
+}
+
+void updateCalibration() {
+  if (!calibArmed) {
+    if (revCount >= 1) {               // first 0-pulse: start the clock
+      calibArmed    = true;
+      calibStartUs  = lastRevUs;
+      calibStartRev = revCount;
+    }
+    return;
+  }
+  uint32_t revs = revCount - calibStartRev;
+  if (revs >= CALIB_REVS) {
+    revolutionPeriodUs = (lastRevUs - calibStartUs) / revs;
+    Serial.printf("calibrated: %lu rev -> period %lu ms\n",
+                  (unsigned long) revs,
+                  (unsigned long) (revolutionPeriodUs / 1000));
+    motorStop();
+    mode = CALIB_ANIM;
+    calibAnimStart = millis();
+  }
+}
+
+void updatePositioning() {
+  if (!posSynced) {
+    if (revCount >= posRefRev) {        // reference 0-pulse reached
+      posSynced = true;
+      uint32_t runUs = (uint32_t)((targetDeg / 360.0f) * (float) revolutionPeriodUs);
+      posStopUs = lastRevUs + runUs;
+    }
+    return;
+  }
+  if ((int32_t)(micros() - posStopUs) >= 0) {
+    motorStop();
+    mode = HOLDING;
+    Serial.printf("positioned at %d deg\n", (int) targetDeg);
+  }
 }
 
 // Latest telemetry decoded from the watch's 7-byte frame.
@@ -187,6 +273,100 @@ class DataCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+// Sinusoidal "breathing" pulse at the active heart rate (toggle switch scales).
+void updateHrLight(float scale) {
+  static uint32_t lastUs = micros();
+  uint32_t nowUs = micros();
+  float dt = (nowUs - lastUs) / 1000000.0f;     // seconds since last call
+  lastUs = nowUs;
+
+  // Ease the effective HR so frequency and amplitude shift gently, not abruptly.
+  static float smoothHr = DEFAULT_HR;
+  smoothHr += (activeHrBpm - smoothHr) * 0.02f;
+
+  float freq = smoothHr / 60.0f;                // beats per second
+  pulsePhase += 2.0f * PI * freq * dt;
+  if (pulsePhase >= 2.0f * PI) {
+    pulsePhase -= 2.0f * PI;
+  }
+
+  float hrSpan = (smoothHr - PULSE_HR_MIN) / (PULSE_HR_MAX - PULSE_HR_MIN);
+  if (hrSpan < 0.0f) { hrSpan = 0.0f; }
+  if (hrSpan > 1.0f) { hrSpan = 1.0f; }
+  float amp = PULSE_AMP_MIN + (PULSE_AMP_MAX - PULSE_AMP_MIN) * hrSpan;
+
+  float level = PULSE_CENTER + amp * sinf(pulsePhase);
+  int b = (int)(level * scale + 0.5f);
+  if (b < 0)   { b = 0; }
+  if (b > 255) { b = 255; }
+  currentBrightness = b;
+  analogWrite(ledPin, currentBrightness);
+}
+
+// "Calibration done" highlight: quick bright flashes, then go position to target.
+void updateCalibAnim(float scale) {
+  uint32_t t = millis() - calibAnimStart;
+  if (t >= CALIB_ANIM_MS) {
+    startPositioning();                          // seek targetDeg (180 by default)
+    return;
+  }
+  bool on = ((t / 150) % 2) == 0;               // ~3 flashes per second
+  currentBrightness = (int)((on ? 255.0f : 0.0f) * scale + 0.5f);
+  analogWrite(ledPin, currentBrightness);
+}
+
+// Print one line per completed revolution.
+void reportEncoder() {
+  static uint32_t lastReportedCount = 0;
+  if (revCount == lastReportedCount) {
+    return;
+  }
+  lastReportedCount = revCount;
+  if (revCount >= 2) {
+    float rpm = 60000000.0f / (float) revPeriodUs;
+    Serial.printf("rev #%lu  period=%lu ms  rpm=%.2f\n",
+                  (unsigned long) revCount,
+                  (unsigned long) (revPeriodUs / 1000), rpm);
+  } else {
+    Serial.printf("rev #%lu  (timing starts next revolution)\n",
+                  (unsigned long) revCount);
+  }
+}
+
+// Parse a serial command line: "D<0-360>" to position, "R" to recalibrate.
+void processCommand(const char* s) {
+  if (s[0] == 'R' || s[0] == 'r') {
+    startCalibration();
+    return;
+  }
+  if (s[0] == 'D' || s[0] == 'd') {
+    int deg = atoi(s + 1);
+    if (deg < 0)   { deg = 0; }
+    if (deg > 360) { deg = 360; }
+    targetDeg = (float) deg;
+    startPositioning();
+    return;
+  }
+  Serial.printf("unknown cmd '%s' (use D<0-360> or R)\n", s);
+}
+
+void handleSerial() {
+  static char buf[16];
+  static uint8_t len = 0;
+  while (Serial.available()) {
+    char ch = (char) Serial.read();
+    if (ch == '\n' || ch == '\r') {
+      if (len > 0) {
+        buf[len] = '\0';
+        processCommand(buf);
+        len = 0;
+      }
+    } else if (len < sizeof(buf) - 1) {
+      buf[len++] = ch;
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);                   // open Serial Monitor at 115200 baud
 
@@ -198,7 +378,7 @@ void setup() {
   pinMode(pinMotorB, OUTPUT);
   pinMode(pinEncoder, INPUT_PULLUP);     // closes to GND; polled in pollEncoder()
 
-  motorRun();                            // spin at constant speed
+  startCalibration();                    // spin up and learn the revolution time
 
   BLEDevice::init(DEVICE_NAME);
   BLEServer* server = BLEDevice::createServer();
@@ -228,61 +408,32 @@ void setup() {
   Serial.println("Service UUID: " SERVICE_UUID);
   Serial.println("Data   UUID : " DATA_CHAR_UUID);
   Serial.println("Notify UUID : " NOTIFY_CHAR_UUID);
+  Serial.println("Motor cmds  : D<0-360> to position, R to recalibrate");
 }
 
 void loop() {
-  // Sinusoidal "breathing" pulse at the active heart rate. Advance the phase by
-  // the elapsed time so changing HR shifts frequency without any discontinuity.
-  // The toggle switch scales overall brightness (OFF=0, MED~half, FULL=full).
-  float scale = readSwitchTarget() / 255.0f;
+  float scale = readSwitchTarget() / 255.0f;   // toggle switch brightness scale
 
-  static uint32_t lastUs = micros();
-  uint32_t nowUs = micros();
-  float dt = (nowUs - lastUs) / 1000000.0f;     // seconds since last loop
-  lastUs = nowUs;
+  handleSerial();                              // D<0-360> / R commands
+  pollEncoder();                               // keep revCount current
 
-  // Ease the effective HR toward the target so frequency and amplitude shift
-  // gently instead of jumping when a new reading arrives.
-  static float smoothHr = DEFAULT_HR;
-  smoothHr += (activeHrBpm - smoothHr) * 0.02f;
-
-  // Advance phase at the heart-rate frequency (continuous across HR changes).
-  float freq = smoothHr / 60.0f;                // beats per second
-  pulsePhase += 2.0f * PI * freq * dt;
-  if (pulsePhase >= 2.0f * PI) {
-    pulsePhase -= 2.0f * PI;
+  switch (mode) {
+    case CALIBRATING:
+      updateCalibration();
+      updateHrLight(scale);
+      break;
+    case CALIB_ANIM:
+      updateCalibAnim(scale);                  // flashes, then starts positioning
+      break;
+    case POSITIONING:
+      updatePositioning();
+      updateHrLight(scale);
+      break;
+    case HOLDING:
+      updateHrLight(scale);
+      break;
   }
 
-  // Amplitude grows with HR: gentle glow at rest, wider swing when racing.
-  float hrSpan = (smoothHr - PULSE_HR_MIN) / (PULSE_HR_MAX - PULSE_HR_MIN);
-  if (hrSpan < 0.0f) { hrSpan = 0.0f; }
-  if (hrSpan > 1.0f) { hrSpan = 1.0f; }
-  float amp = PULSE_AMP_MIN + (PULSE_AMP_MAX - PULSE_AMP_MIN) * hrSpan;
-
-  float level = PULSE_CENTER + amp * sinf(pulsePhase);   // before toggle scaling
-  int b = (int)(level * scale + 0.5f);
-  if (b < 0)   { b = 0; }
-  if (b > 255) { b = 255; }
-  currentBrightness = b;
-  analogWrite(ledPin, currentBrightness);
-
-  // Poll the encoder switch (debounced) and report once per completed revolution.
-  pollEncoder();
-  static uint32_t lastReportedCount = 0;
-  uint32_t count  = revCount;
-  uint32_t period = revPeriodUs;
-
-  if (count != lastReportedCount) {
-    lastReportedCount = count;
-    if (count >= 2) {                        // first pulse has no prior edge to time from
-      float rpm = 60000000.0f / (float) period;
-      Serial.printf("rev #%lu  period=%lu ms  rpm=%.2f\n",
-                    (unsigned long) count, (unsigned long)(period / 1000), rpm);
-    } else {
-      Serial.printf("rev #%lu  (timing starts next revolution)\n",
-                    (unsigned long) count);
-    }
-  }
-
+  reportEncoder();
   delay(5);
 }
