@@ -14,7 +14,7 @@ function buildDeviceMenu() {
 
     for (var i = 0; i < list.size(); i++) {
         var e = list[i];
-        var label = (e[:name] != null) ? e[:name] : "(no name)";
+        var label = e[:label];
         var sub = e[:rssi] + " dBm";
         if (e[:uuid] != null) {
             sub = sub + "  " + shortenUuid(e[:uuid]);

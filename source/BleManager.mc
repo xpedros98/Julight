@@ -83,22 +83,34 @@ class BleManager extends Ble.BleDelegate {
         }
     }
 
-    private function addOrUpdate(sr as Ble.ScanResult) {
-        var name = sr.getDeviceName();
-        var uuidStr = firstUuidString(sr);
-        var rssiVal = sr.getRssi();
-        var key = (name != null) ? name : ((uuidStr != null) ? uuidStr : "(unknown)");
+    // Bluetooth SIG company identifiers -> friendly vendor names.
+    private const COMPANY_NAMES = {
+        0x004C => "Apple",
+        0x0006 => "Microsoft",
+        0x0075 => "Samsung",
+        0x00E0 => "Google",
+        0x0087 => "Garmin",
+        0x0059 => "Nordic",
+        0x02E5 => "Espressif",
+        0x0157 => "Huami",
+        0x0499 => "Ruuvi"
+    };
 
+    private function addOrUpdate(sr as Ble.ScanResult) {
+        // Dedup by real device identity, not by name (many devices are nameless).
         for (var i = 0; i < _discovered.size(); i++) {
-            if (_discovered[i][:key].equals(key)) {
-                _discovered[i][:rssi] = rssiVal;
-                _discovered[i][:scan] = sr;
+            if (_discovered[i][:scan].isSameDevice(sr)) {
+                _discovered[i][:rssi]  = sr.getRssi();
+                _discovered[i][:scan]  = sr;
+                _discovered[i][:label] = deriveLabel(sr);
                 return;
             }
         }
         _discovered.add({
-            :key => key, :name => name, :uuid => uuidStr,
-            :rssi => rssiVal, :scan => sr
+            :label => deriveLabel(sr),
+            :uuid  => firstUuidString(sr),
+            :rssi  => sr.getRssi(),
+            :scan  => sr
         });
     }
 
@@ -106,6 +118,58 @@ class BleManager extends Ble.BleDelegate {
         var it = sr.getServiceUuids();
         var u = it.next();
         return (u == null) ? null : u.toString();
+    }
+
+    // Best available human label: name -> vendor -> appearance -> unknown.
+    private function deriveLabel(sr as Ble.ScanResult) {
+        var name = sr.getDeviceName();
+        if (name != null && name.length() > 0) {
+            return name;
+        }
+        var vendor = vendorName(sr);
+        if (vendor != null) {
+            return vendor;
+        }
+        var appr = appearanceName(sr.getAppearance());
+        if (appr != null) {
+            return appr;
+        }
+        return "(unknown)";
+    }
+
+    private function vendorName(sr as Ble.ScanResult) {
+        var it = sr.getManufacturerSpecificDataIterator();
+        if (it == null) {
+            return null;
+        }
+        var entry = it.next();
+        if (entry == null) {
+            return null;
+        }
+        var id = entry[:companyId];
+        if (id == null) {
+            return null;
+        }
+        if (COMPANY_NAMES.hasKey(id)) {
+            return COMPANY_NAMES[id];
+        }
+        return "Vendor 0x" + id.format("%04X");
+    }
+
+    // GAP appearance: top 10 bits are the category.
+    private function appearanceName(a) {
+        if (a == null || a == 0) {
+            return null;
+        }
+        var cat = a >> 6;
+        if (cat == 1)  { return "Phone"; }
+        if (cat == 2)  { return "Computer"; }
+        if (cat == 3)  { return "Watch"; }
+        if (cat == 5)  { return "Display"; }
+        if (cat == 8)  { return "Tag"; }
+        if (cat == 13) { return "HR Sensor"; }
+        if (cat == 18) { return "Cycling Sensor"; }
+        return "Appearance " + a;
     }
 
     // ---------------- connection ----------------
