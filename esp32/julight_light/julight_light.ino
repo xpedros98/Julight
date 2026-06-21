@@ -139,15 +139,21 @@ void pollEncoder() {
   }
 }
 
-// L9110S: drive one input with PWM, hold the other low -> constant speed, one way.
+// L9110S: PWM one input, the other at 0 -> drive one direction. Use analogWrite
+// on BOTH pins (never digitalWrite) so duty 0 truly releases the LEDC channel --
+// mixing digitalWrite after analogWrite can leave the PWM running on ESP32.
 void motorRun() {
   analogWrite(pinMotorA, MOTOR_SPEED);
-  digitalWrite(pinMotorB, LOW);
+  analogWrite(pinMotorB, 0);
+  Serial.printf("motor: ENABLED (PWM %d)\n", MOTOR_SPEED);
 }
 
+// Disable the driver: both inputs at 0 -> motor de-energized (coasts free). Stays
+// off until the next move (D) or recalibration (R) calls motorRun() again.
 void motorStop() {
-  digitalWrite(pinMotorA, LOW);
-  digitalWrite(pinMotorB, LOW);
+  analogWrite(pinMotorA, 0);
+  analogWrite(pinMotorB, 0);
+  Serial.println("motor: DISABLED");
 }
 
 // Start (or restart) calibration: spin and learn the revolution time.
