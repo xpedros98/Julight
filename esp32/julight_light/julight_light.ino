@@ -164,9 +164,9 @@ void startCalibration() {
   Serial.println("calibrating: measuring revolution time...");
 }
 
-// Begin moving to targetDeg by timing forward from a 0-pulse. We skip one full
-// revolution first so the motor is at steady (calibration) speed before we start
-// timing -- otherwise spin-up from a stop would corrupt the move time.
+// Begin moving to targetDeg by timing forward from the first 0-pulse after start.
+// The travel from the held position to the 0 mark gives the motor time to reach
+// speed, so no extra warm-up lap is needed.
 void startPositioning() {
   if (revolutionPeriodUs == 0) {
     Serial.println("not calibrated yet - send R first");
@@ -174,7 +174,7 @@ void startPositioning() {
   }
   mode = POSITIONING;
   posSynced = false;
-  posRefRev = revCount + 2;            // skip ~1 rev of spin-up, then reference
+  posRefRev = revCount + 1;            // reference the next 0-pulse
   motorRun();
   Serial.printf("positioning to %d deg...\n", (int) targetDeg);
 }
