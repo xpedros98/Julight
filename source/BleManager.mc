@@ -24,6 +24,7 @@ class BleManager extends Ble.BleDelegate {
     private var _scanning = false;
     private var _discovered = [];     // [{ :key, :name, :uuid, :rssi, :scan }]
     private var _statusView = null;
+    private var _reporter = null;     // periodic sensor telemetry sender
 
     public var connState = "idle";
     public var rssi = null;
@@ -40,6 +41,7 @@ class BleManager extends Ble.BleDelegate {
 
     function shutdown() {
         stopScan();
+        stopReporting();
         if (_device != null) {
             Ble.unpairDevice(_device);
             _device = null;
@@ -186,9 +188,25 @@ class BleManager extends Ble.BleDelegate {
             _device = device;
             setState("connected");
             enableNotifications();
+            startReporting();
         } else {
+            stopReporting();
             _device = null;
             setState("disconnected");
+        }
+    }
+
+    // Start the periodic sensor telemetry sender (idempotent).
+    private function startReporting() {
+        if (_reporter == null) {
+            _reporter = new SensorReporter();
+        }
+        _reporter.start();
+    }
+
+    private function stopReporting() {
+        if (_reporter != null) {
+            _reporter.stop();
         }
     }
 

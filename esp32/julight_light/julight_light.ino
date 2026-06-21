@@ -51,9 +51,11 @@ int readSwitchTarget() {
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
     deviceConnected = true;
+    Serial.println("master connected");   // watch (BLE central) linked up
   }
   void onDisconnect(BLEServer* s) override {
     deviceConnected = false;
+    Serial.println("master disconnected");
     BLEDevice::startAdvertising();        // allow the watch to reconnect
   }
 };
@@ -62,13 +64,28 @@ class DataCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* c) override {
     uint8_t* data = c->getData();
     size_t   len  = c->getLength();
+
+    // Echo what the watch sent: byte count + each byte in hex.
+    Serial.print("watch -> ");
+    Serial.print(len);
+    Serial.print(" byte(s): [");
+    for (size_t i = 0; i < len; i++) {
+      if (i > 0) { Serial.print(" "); }
+      Serial.printf("0x%02X", data[i]);
+    }
+    Serial.println("]");
+
     if (len >= 1) {
       targetBrightness = clampByte(data[0]);   // first byte = brightness 0..255
+      Serial.print("  brightness target = ");
+      Serial.println(targetBrightness);
     }
   }
 };
 
 void setup() {
+  Serial.begin(115200);                   // open Serial Monitor at 115200 baud
+
   pinMode(pinLow,  INPUT_PULLUP);
   pinMode(pinHigh, INPUT_PULLUP);
   pinMode(ledPin,  OUTPUT);
@@ -96,6 +113,14 @@ void setup() {
   adv->addServiceUUID(SERVICE_UUID);       // so the watch can match by UUID
   adv->setScanResponse(true);
   BLEDevice::startAdvertising();
+
+  // Print BLE identity so it can be matched against the Connect IQ app.
+  Serial.println("BLE advertising as: " DEVICE_NAME);
+  Serial.print("MAC address : ");
+  Serial.println(BLEDevice::getAddress().toString().c_str());
+  Serial.println("Service UUID: " SERVICE_UUID);
+  Serial.println("Data   UUID : " DATA_CHAR_UUID);
+  Serial.println("Notify UUID : " NOTIFY_CHAR_UUID);
 }
 
 void loop() {
