@@ -275,7 +275,18 @@ class BleManager extends Ble.BleDelegate {
     }
 
     function onCharacteristicChanged(characteristic, value) {
-        System.println("notify <- " + value);
+        // Notify payload from the ESP32: 1 signed byte = live link RSSI (dBm).
+        if (value != null && value.size() >= 1) {
+            var r = value[0];
+            if (r > 127) {
+                r -= 256;               // interpret as int8
+            }
+            rssi = r;
+            if (_statusView != null) {
+                _statusView.updateState(connState, rssi);
+            }
+            WatchUi.requestUpdate();
+        }
     }
 
     function onDescriptorWrite(descriptor, status) {
