@@ -1,24 +1,36 @@
 using Toybox.WatchUi;
 using Toybox.Graphics;
 using Toybox.Math;
-using Toybox.Lang;
 
-class JulightView extends WatchUi.View {
+// Shown after a device is selected: connection state, RSSI/distance,
+// and a hint for sending data. The ESP32 receives writes here.
+class StatusView extends WatchUi.View {
 
-    private var _state = "starting";
+    private var _state = "connecting";
     private var _rssi = null;
 
     function initialize() {
         View.initialize();
     }
 
-    // Called by BleManager whenever connection state / RSSI changes.
+    function onShow() {
+        if (gBle != null) {
+            gBle.setStatusView(self);
+            _state = gBle.connState;
+            _rssi = gBle.rssi;
+        }
+    }
+
+    function onHide() {
+        if (gBle != null) {
+            gBle.setStatusView(null);
+        }
+    }
+
+    // Called by BleManager when state / RSSI changes.
     function updateState(state, rssi) {
         _state = state;
         _rssi = rssi;
-    }
-
-    function onLayout(dc) {
     }
 
     function onUpdate(dc) {
@@ -28,25 +40,26 @@ class JulightView extends WatchUi.View {
         var cx = dc.getWidth() / 2;
         var cy = dc.getHeight() / 2;
 
-        dc.drawText(cx, cy - 55, Graphics.FONT_SMALL, "Julight BLE",
+        dc.drawText(cx, cy - 60, Graphics.FONT_SMALL, "Julight BLE",
             Graphics.TEXT_JUSTIFY_CENTER);
-        dc.drawText(cx, cy - 25, Graphics.FONT_MEDIUM, _state,
+        dc.drawText(cx, cy - 32, Graphics.FONT_MEDIUM, _state,
             Graphics.TEXT_JUSTIFY_CENTER);
 
         var rssiText = (_rssi == null) ? "RSSI: --" : ("RSSI: " + _rssi + " dBm");
-        dc.drawText(cx, cy + 15, Graphics.FONT_SMALL, rssiText,
+        dc.drawText(cx, cy + 8, Graphics.FONT_SMALL, rssiText,
             Graphics.TEXT_JUSTIFY_CENTER);
 
         if (_rssi != null) {
-            dc.drawText(cx, cy + 40, Graphics.FONT_SMALL,
+            dc.drawText(cx, cy + 32, Graphics.FONT_SMALL,
                 "~ " + estimateDistance(_rssi) + " m",
                 Graphics.TEXT_JUSTIFY_CENTER);
         }
+
+        dc.drawText(cx, dc.getHeight() - 26, Graphics.FONT_XTINY,
+            "START: send", Graphics.TEXT_JUSTIFY_CENTER);
     }
 
-    // Crude log-distance path-loss estimate.
-    // txPower = expected RSSI at 1 m; n = environmental factor (2.0 = free space).
-    // This is a rough proxy only - smoothing/calibration comes later.
+    // Crude log-distance estimate (txPower at 1 m = -59 dBm, n = 2.0).
     private function estimateDistance(rssi) {
         var txPower = -59.0;
         var n = 2.0;

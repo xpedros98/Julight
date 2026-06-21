@@ -1,7 +1,7 @@
 using Toybox.Application;
 using Toybox.WatchUi;
 
-// Global handle to the BLE manager so the input delegate can reach it.
+// Global handle to the BLE manager so views/delegates can reach it.
 var gBle = null;
 
 class JulightApp extends Application.AppBase {
@@ -19,12 +19,10 @@ class JulightApp extends Application.AppBase {
         }
     }
 
-    // Returns the initial view + input delegate of the app.
+    // Start on the main screen with the "Connect a device" button.
     function getInitialView() {
-        var view = new JulightView();
-        gBle = new BleManager(view);
+        gBle = new BleManager();
         gBle.start();
-        var delegate = new JulightDelegate();
-        return [view, delegate];
+        return [new MainView(), new MainDelegate()];
     }
 }

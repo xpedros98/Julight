@@ -1,13 +1,13 @@
 using Toybox.WatchUi;
 using Toybox.System;
 
-class JulightDelegate extends WatchUi.BehaviorDelegate {
+// Status screen input: START sends a test payload, BACK returns to the list.
+class StatusDelegate extends WatchUi.BehaviorDelegate {
 
     function initialize() {
         BehaviorDelegate.initialize();
     }
 
-    // SELECT/START: send a test payload to the ESP32.
     function onSelect() {
         if (gBle != null) {
             var ok = gBle.sendData([0xDE, 0xAD, 0xBE, 0xEF]b);
@@ -16,9 +16,8 @@ class JulightDelegate extends WatchUi.BehaviorDelegate {
         return true;
     }
 
-    // BACK: exit the app.
     function onBack() {
-        System.exit();
+        WatchUi.popView(WatchUi.SLIDE_RIGHT);
         return true;
     }
 }

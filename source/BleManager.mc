@@ -4,85 +4,131 @@ using Toybox.Lang;
 using Toybox.WatchUi;
 
 //
-// BleManager - the core of "Option 2".
+// BleManager - the watch acts as a BLE *central*.
 //
-// The watch acts as a BLE *central*:
-//   1. scan for the ESP32 (matched by our custom service UUID),
-//   2. read RSSI from the scan result (-> rough distance),
-//   3. connect (pair) to it,
-//   4. enable notifications, and
-//   5. write sensor payloads to the ESP32's data characteristic.
+// Flow:
+//   beginScan()  -> collect nearby devices into _discovered (name / uuid / rssi)
+//   connectTo(scanResult) -> pair, then write sensor payloads over GATT
 //
-// The UUIDs below MUST match the ESP32 firmware's GATT server.
+// The data/notify UUIDs must match the ESP32 firmware. The service UUID is what
+// the ESP32 advertises; only devices exposing it can actually receive our data,
+// but we list every nearby device so the user can choose.
 //
 class BleManager extends Ble.BleDelegate {
 
-    // ---- GATT layout (keep in sync with the ESP32) ----
-    public const SERVICE_UUID   = Ble.stringToUuid("c3a1f200-9b0e-4f1a-8a01-0e1d2c3b4a59");
-    // watch -> ESP32 (we write sensor data here)
-    public const DATA_CHAR_UUID = Ble.stringToUuid("c3a1f201-9b0e-4f1a-8a01-0e1d2c3b4a59");
-    // ESP32 -> watch (notifications / acks)
+    public const SERVICE_UUID     = Ble.stringToUuid("c3a1f200-9b0e-4f1a-8a01-0e1d2c3b4a59");
+    public const DATA_CHAR_UUID   = Ble.stringToUuid("c3a1f201-9b0e-4f1a-8a01-0e1d2c3b4a59");
     public const NOTIFY_CHAR_UUID = Ble.stringToUuid("c3a1f202-9b0e-4f1a-8a01-0e1d2c3b4a59");
 
-    private var _view;
     private var _device = null;
     private var _scanning = false;
+    private var _discovered = [];     // [{ :key, :name, :uuid, :rssi, :scan }]
+    private var _statusView = null;
 
-    // Exposed to the view for display.
-    public var rssi = null;            // dBm from last matching scan result
-    public var connState = "idle";     // human-readable state string
+    public var connState = "idle";
+    public var rssi = null;
 
-    function initialize(view) {
+    function initialize() {
         BleDelegate.initialize();
-        _view = view;
     }
 
-    // Register our GATT profile, become the BLE delegate, and start scanning.
+    // Register our GATT profile and become the BLE delegate (no scan yet).
     function start() {
         registerProfiles();
         Ble.setDelegate(self);
-        startScan();
     }
 
     function shutdown() {
-        if (_scanning) {
-            Ble.setScanState(Ble.SCAN_STATE_OFF);
-            _scanning = false;
-        }
+        stopScan();
         if (_device != null) {
             Ble.unpairDevice(_device);
             _device = null;
         }
     }
 
-    // Describe the service/characteristics we expect so the SDK surfaces them.
     function registerProfiles() {
         var profile = {
             :uuid => SERVICE_UUID,
             :characteristics => [
                 { :uuid => DATA_CHAR_UUID },
-                {
-                    :uuid => NOTIFY_CHAR_UUID,
-                    :descriptors => [ Ble.cccdUuid() ]   // 0x2902, to toggle notifications
-                }
+                { :uuid => NOTIFY_CHAR_UUID, :descriptors => [ Ble.cccdUuid() ] }
             ]
         };
         Ble.registerProfile(profile);
     }
 
-    function startScan() {
+    // ---------------- discovery ----------------
+
+    function beginScan() {
+        _discovered = [];
         _scanning = true;
-        setState("scanning");
+        connState = "scanning";
         Ble.setScanState(Ble.SCAN_STATE_SCANNING);
     }
 
     function stopScan() {
-        _scanning = false;
-        Ble.setScanState(Ble.SCAN_STATE_OFF);
+        if (_scanning) {
+            _scanning = false;
+            Ble.setScanState(Ble.SCAN_STATE_OFF);
+        }
+    }
+
+    function getDiscovered() {
+        return _discovered;
+    }
+
+    function onScanResults(scanResults) {
+        for (var r = scanResults.next(); r != null; r = scanResults.next()) {
+            addOrUpdate(r as Ble.ScanResult);
+        }
+    }
+
+    private function addOrUpdate(sr as Ble.ScanResult) {
+        var name = sr.getDeviceName();
+        var uuidStr = firstUuidString(sr);
+        var rssiVal = sr.getRssi();
+        var key = (name != null) ? name : ((uuidStr != null) ? uuidStr : "(unknown)");
+
+        for (var i = 0; i < _discovered.size(); i++) {
+            if (_discovered[i][:key].equals(key)) {
+                _discovered[i][:rssi] = rssiVal;
+                _discovered[i][:scan] = sr;
+                return;
+            }
+        }
+        _discovered.add({
+            :key => key, :name => name, :uuid => uuidStr,
+            :rssi => rssiVal, :scan => sr
+        });
+    }
+
+    private function firstUuidString(sr as Ble.ScanResult) {
+        var it = sr.getServiceUuids();
+        var u = it.next();
+        return (u == null) ? null : u.toString();
+    }
+
+    // ---------------- connection ----------------
+
+    function connectTo(scanResult as Ble.ScanResult) {
+        stopScan();
+        rssi = scanResult.getRssi();
+        _device = Ble.pairDevice(scanResult);
+        setState("connecting");
+    }
+
+    function onConnectedStateChanged(device, state) {
+        if (state == Ble.CONNECTION_STATE_CONNECTED) {
+            _device = device;
+            setState("connected");
+            enableNotifications();
+        } else {
+            _device = null;
+            setState("disconnected");
+        }
     }
 
     // Write a byte array to the ESP32's data characteristic.
-    // Returns true if the write was requested, false if not connected/ready.
     function sendData(bytes) {
         var ch = getDataChar();
         if (ch == null) {
@@ -97,48 +143,18 @@ class BleManager extends Ble.BleDelegate {
         }
     }
 
-    public function isConnected() {
+    function isConnected() {
         return _device != null;
     }
 
-    // ---------------- BleDelegate callbacks ----------------
-
-    function onScanResults(scanResults) {
-        for (var r = scanResults.next(); r != null; r = scanResults.next()) {
-            var sr = r as Ble.ScanResult;
-            if (matchesService(sr)) {
-                rssi = sr.getRssi();
-                setState("connecting");
-                stopScan();
-                _device = Ble.pairDevice(sr);
-                return;
-            }
-        }
-    }
-
-    function onConnectedStateChanged(device, state) {
-        if (state == Ble.CONNECTION_STATE_CONNECTED) {
-            _device = device;
-            setState("connected");
-            enableNotifications();
-        } else {
-            _device = null;
-            setState("disconnected");
-            startScan();   // try to find it again
-        }
-    }
-
     function onCharacteristicWrite(characteristic, status) {
-        // status == Ble.STATUS_SUCCESS means the ESP32 acked our write.
     }
 
     function onCharacteristicChanged(characteristic, value) {
-        // A notification from the ESP32 arrived.
         System.println("notify <- " + value);
     }
 
     function onDescriptorWrite(descriptor, status) {
-        // CCCD write result (notifications enabled/disabled).
     }
 
     function onProfileRegister(uuid, status) {
@@ -147,16 +163,6 @@ class BleManager extends Ble.BleDelegate {
 
     // ---------------- helpers ----------------
 
-    private function matchesService(scanResult as Ble.ScanResult) {
-        var uuids = scanResult.getServiceUuids();
-        for (var u = uuids.next(); u != null; u = uuids.next()) {
-            if (u.equals(SERVICE_UUID)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private function enableNotifications() {
         var ch = getNotifyChar();
         if (ch == null) {
@@ -164,15 +170,12 @@ class BleManager extends Ble.BleDelegate {
         }
         var cccd = ch.getDescriptor(Ble.cccdUuid());
         if (cccd != null) {
-            cccd.requestWrite([0x01, 0x00]b);   // enable notifications
+            cccd.requestWrite([0x01, 0x00]b);
         }
     }
 
     private function getService() {
-        if (_device == null) {
-            return null;
-        }
-        return _device.getService(SERVICE_UUID);
+        return (_device == null) ? null : _device.getService(SERVICE_UUID);
     }
 
     private function getDataChar() {
@@ -185,10 +188,14 @@ class BleManager extends Ble.BleDelegate {
         return (svc == null) ? null : svc.getCharacteristic(NOTIFY_CHAR_UUID);
     }
 
+    function setStatusView(view) {
+        _statusView = view;
+    }
+
     private function setState(s) {
         connState = s;
-        if (_view != null) {
-            _view.updateState(connState, rssi);
+        if (_statusView != null) {
+            _statusView.updateState(connState, rssi);
         }
         WatchUi.requestUpdate();
     }
