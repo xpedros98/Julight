@@ -53,6 +53,13 @@ WiFiUDP audioUdp;
 volatile int      audioBrightness = 0;    // last brightness byte received over UDP
 volatile uint32_t lastAudioMs     = 0;    // millis() of the last UDP frame (0 = none)
 
+// Audio frames arrive ~60x/sec and jump abruptly, which reads as flicker when
+// written raw. Low-pass the level: each loop the shown brightness eases a
+// fraction (AUDIO_SMOOTH) of the way toward the latest target. Smaller = smoother
+// but laggier; ~0.18 at the 5 ms loop gives a ~25 ms time constant.
+const float AUDIO_SMOOTH    = 0.18f;
+float       smoothedAudio   = 0.0f;       // filtered audio brightness (0..255)
+
 // --- Pin map ---------------------------------------------------------------
 //   Toggle switch (COM->GND) : pins 4 / 5      (OFF / MED / FULL selector)
 //   Light (IRLZ44N gate)     : GPIO 27         (PWM brightness)
@@ -86,9 +93,11 @@ float pulsePhase         = 0.0f;       // sinusoid phase, radians
 
 // Light pulse shaping: brightness = CENTER +/- amplitude*sin(phase), where the
 // amplitude grows with HR -> a subtle glow at rest, a wider swing when racing.
-const float PULSE_CENTER  = 128.0f;    // mid brightness the pulse swings around
-const float PULSE_AMP_MIN = 18.0f;     // swing at PULSE_HR_MIN (gentle)
-const float PULSE_AMP_MAX = 100.0f;    // swing at PULSE_HR_MAX (dramatic)
+// The center is kept low (dim baseline) and the swing wide, so the pulse is
+// clearly visible yet never near full brightness (255 reserved for feedback).
+const float PULSE_CENTER  = 70.0f;     // mid brightness the pulse swings around
+const float PULSE_AMP_MIN = 45.0f;     // swing at PULSE_HR_MIN (clearly visible)
+const float PULSE_AMP_MAX = 70.0f;     // swing at PULSE_HR_MAX (deep, dramatic)
 const float PULSE_HR_MIN  = 75.0f;     // HR mapped to AMP_MIN
 const float PULSE_HR_MAX  = 180.0f;    // HR mapped to AMP_MAX
 
@@ -386,7 +395,9 @@ void pollAudioUdp() {
 // fall back to the HR breathing pulse. The toggle switch still scales both.
 void updateLight(float scale) {
   if (lastAudioMs != 0 && (millis() - lastAudioMs) < AUDIO_TIMEOUT_MS) {
-    int b = (int)(audioBrightness * scale + 0.5f);
+    // Ease the filtered level toward the latest target, then scale + clamp.
+    smoothedAudio += (audioBrightness - smoothedAudio) * AUDIO_SMOOTH;
+    int b = (int)(smoothedAudio * scale + 0.5f);
     if (b < 0)   { b = 0; }
     if (b > 255) { b = 255; }
     currentBrightness = b;
