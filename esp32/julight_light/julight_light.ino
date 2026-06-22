@@ -60,6 +60,11 @@ volatile uint32_t lastAudioMs     = 0;    // millis() of the last UDP frame (0 =
 const float AUDIO_SMOOTH    = 0.18f;
 float       smoothedAudio   = 0.0f;       // filtered audio brightness (0..255)
 
+// Floor for the audio level so the light never goes fully dark while the stream
+// is live: any non-zero switch setting holds at least this brightness (0..255).
+// Set to 0 to allow true black again.
+const int   AUDIO_MIN_BRIGHT = 20;
+
 // --- Pin map ---------------------------------------------------------------
 //   Toggle switch (COM->GND) : pins 4 / 5      (OFF / MED / FULL selector)
 //   Light (IRLZ44N gate)     : GPIO 27         (PWM brightness)
@@ -399,6 +404,9 @@ void updateLight(float scale) {
     smoothedAudio += (audioBrightness - smoothedAudio) * AUDIO_SMOOTH;
     int b = (int)(smoothedAudio * scale + 0.5f);
     if (b < 0)   { b = 0; }
+    // Hold a minimum brightness so the light never goes fully dark on quiet
+    // passages, but only when the switch isn't OFF (scale > 0).
+    if (scale > 0.0f && b < AUDIO_MIN_BRIGHT) { b = AUDIO_MIN_BRIGHT; }
     if (b > 255) { b = 255; }
     currentBrightness = b;
     analogWrite(ledPin, currentBrightness);
