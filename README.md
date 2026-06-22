@@ -67,3 +67,4 @@ Or use the Garmin Monkey C VS Code extension (F5 to run).
 - [ ] Add heart-rate + stream batched sensor data to the ESP32
 - [ ] RSSI smoothing / calibration for a more stable distance estimate
 - [ ] Reconnect / power handling
+- [x] WiFi audio mode: stream MP3 FFT (bass) → light brightness over UDP (see `python/`)

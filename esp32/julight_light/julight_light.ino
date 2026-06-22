@@ -21,16 +21,37 @@
 //   plays a light animation, then positions at 180 deg. Serial commands:
 //     D<0-360>  move to that absolute position (e.g. "D65")
 //     R         recalibrate
+//
+// WiFi audio mode (overrides the HR pulse while packets arrive):
+//   Joins a WiFi network and listens for UDP brightness frames on AUDIO_UDP_PORT.
+//   Each datagram's first byte (0..255) sets the light directly (still scaled by
+//   the toggle switch). A companion Python script analyses an MP3, runs an FFT,
+//   maps the bass energy to brightness and streams these bytes ~60x/sec. After
+//   AUDIO_TIMEOUT_MS with no packet, the light reverts to the HR breathing pulse.
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
 
 #define SERVICE_UUID     "c3a1f200-9b0e-4f1a-8a01-0e1d2c3b4a59"
 #define DATA_CHAR_UUID   "c3a1f201-9b0e-4f1a-8a01-0e1d2c3b4a59"
 #define NOTIFY_CHAR_UUID "c3a1f202-9b0e-4f1a-8a01-0e1d2c3b4a59"
 #define DEVICE_NAME      "Julight-ESP32"
+
+// --- WiFi audio link -------------------------------------------------------
+// Fill in your network. The ESP32 joins as a station; the Python script sends
+// UDP brightness frames to this device's IP on AUDIO_UDP_PORT (printed at boot).
+#define WIFI_SSID      "4-04"
+#define WIFI_PASSWORD  "Viernulvier"
+const uint16_t AUDIO_UDP_PORT   = 4210;   // UDP port the brightness stream targets
+const uint32_t AUDIO_TIMEOUT_MS = 300;    // no packet for this long -> back to HR pulse
+
+WiFiUDP audioUdp;
+volatile int      audioBrightness = 0;    // last brightness byte received over UDP
+volatile uint32_t lastAudioMs     = 0;    // millis() of the last UDP frame (0 = none)
 
 // --- Pin map ---------------------------------------------------------------
 //   Toggle switch (COM->GND) : pins 4 / 5      (OFF / MED / FULL selector)
@@ -324,6 +345,57 @@ void updateHrLight(float scale) {
   analogWrite(ledPin, currentBrightness);
 }
 
+// Connect to WiFi (non-fatal: if it fails, BLE/HR still work) and start the UDP
+// listener. Tries for ~10 s so a slow AP doesn't hang boot forever.
+void connectWiFi() {
+  Serial.printf("WiFi: connecting to \"%s\" ...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    audioUdp.begin(AUDIO_UDP_PORT);
+    Serial.print("WiFi: connected, IP = ");
+    Serial.println(WiFi.localIP());
+    Serial.printf("Audio: streaming brightness bytes to UDP %s:%u\n",
+                  WiFi.localIP().toString().c_str(), AUDIO_UDP_PORT);
+  } else {
+    Serial.println("WiFi: not connected (audio mode disabled; HR pulse still runs)");
+  }
+}
+
+// Drain any pending UDP brightness frames; the last byte of the newest packet
+// wins. Stamps lastAudioMs so updateLight() knows the audio stream is live.
+void pollAudioUdp() {
+  static uint8_t pkt[64];
+  int sz;
+  while ((sz = audioUdp.parsePacket()) > 0) {
+    int n = audioUdp.read(pkt, sizeof(pkt));
+    if (n > 0) {
+      audioBrightness = pkt[0];           // byte 0 = brightness 0..255
+      lastAudioMs = millis();
+    }
+  }
+}
+
+// Pick the light source: the audio stream overrides while it is live, otherwise
+// fall back to the HR breathing pulse. The toggle switch still scales both.
+void updateLight(float scale) {
+  if (lastAudioMs != 0 && (millis() - lastAudioMs) < AUDIO_TIMEOUT_MS) {
+    int b = (int)(audioBrightness * scale + 0.5f);
+    if (b < 0)   { b = 0; }
+    if (b > 255) { b = 255; }
+    currentBrightness = b;
+    analogWrite(ledPin, currentBrightness);
+  } else {
+    updateHrLight(scale);
+  }
+}
+
 // "Calibration done" highlight: quick bright flashes, then go position to target.
 void updateCalibAnim(float scale) {
   uint32_t t = millis() - calibAnimStart;
@@ -401,6 +473,8 @@ void setup() {
 
   startCalibration();                    // spin up and learn the revolution time
 
+  connectWiFi();                         // join network + open UDP audio listener
+
   BLEDevice::init(DEVICE_NAME);
   BLEServer* server = BLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
@@ -437,21 +511,22 @@ void loop() {
 
   handleSerial();                              // D<0-360> / R commands
   pollEncoder();                               // keep revCount current
+  pollAudioUdp();                              // ingest WiFi brightness frames
 
   switch (mode) {
     case CALIBRATING:
       updateCalibration();
-      updateHrLight(scale);
+      updateLight(scale);                      // audio overrides, else HR pulse
       break;
     case CALIB_ANIM:
       updateCalibAnim(scale);                  // flashes, then starts positioning
       break;
     case POSITIONING:
       updatePositioning();
-      updateHrLight(scale);
+      updateLight(scale);
       break;
     case HOLDING:
-      updateHrLight(scale);
+      updateLight(scale);
       break;
   }
 

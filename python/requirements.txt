@@ -1,0 +1,3 @@
+numpy
+librosa        # MP3 decode (needs ffmpeg on PATH) + resampling
+sounddevice    # local audio playback; omit if you only use --no-audio
